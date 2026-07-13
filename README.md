@@ -17,7 +17,6 @@ Or with docker compose:
 ```bash
 docker compose up -d
 ```
-
 To customize behavior, mount a JSON config file and pass `--config`:
 
 ```bash
