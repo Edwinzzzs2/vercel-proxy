@@ -14,7 +14,13 @@ import (
 var BuildVersion = "dev"
 
 func main() {
-	addr := flag.String("addr", ":3000", "address to listen on")
+	defaultAddr := ":3000"
+	// Vercel 运行时通过 PORT 分配监听端口，本地和 Docker 仍默认使用 3000。
+	if port := os.Getenv("PORT"); port != "" {
+		defaultAddr = ":" + port
+	}
+
+	addr := flag.String("addr", defaultAddr, "address to listen on")
 	configPath := flag.String("config", "", "path to JSON config file")
 	flag.Parse()
 
