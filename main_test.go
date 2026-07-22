@@ -3,7 +3,10 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"github.com/tbxark/vercel-proxy/api"
 )
 
 func TestLoadConfigReturnsDefaultWhenPathIsEmpty(t *testing.T) {
@@ -47,5 +50,23 @@ func TestLoadConfigReadsJSONFile(t *testing.T) {
 	}
 	if !config.DisableCompression {
 		t.Fatal("DisableCompression = false, want true")
+	}
+}
+
+func TestApplyEnvConfigOverridesAuthenticationAndWhitelist(t *testing.T) {
+	t.Setenv("PROXY_AUTH_TOKEN", " env-secret ")
+	t.Setenv("PROXY_DOMAIN_WHITELIST", "openapi-rdc.aliyuncs.com, api.example.com ")
+
+	config := applyEnvConfig(api.Config{
+		AuthToken:       "file-secret",
+		DomainWhitelist: []string{"file.example.com"},
+	})
+
+	if config.AuthToken != "env-secret" {
+		t.Fatalf("AuthToken = %q, want %q", config.AuthToken, "env-secret")
+	}
+	want := []string{"openapi-rdc.aliyuncs.com", "api.example.com"}
+	if !reflect.DeepEqual(config.DomainWhitelist, want) {
+		t.Fatalf("DomainWhitelist = %#v, want %#v", config.DomainWhitelist, want)
 	}
 }

@@ -46,6 +46,7 @@ func TestProxyURLKeepsExistingFormats(t *testing.T) {
 
 func TestConfigUnmarshalsFromJSON(t *testing.T) {
 	data := []byte(`{
+		"authToken": "proxy-secret",
 		"socks5Proxy": "127.0.0.1:1080",
 		"domainWhitelist": ["example.com", "api.example.org"],
 		"disableCompression": true,
@@ -60,6 +61,9 @@ func TestConfigUnmarshalsFromJSON(t *testing.T) {
 	if config.Socks5Proxy != "127.0.0.1:1080" {
 		t.Fatalf("Socks5Proxy = %q, want %q", config.Socks5Proxy, "127.0.0.1:1080")
 	}
+	if config.AuthToken != "proxy-secret" {
+		t.Fatalf("AuthToken = %q, want %q", config.AuthToken, "proxy-secret")
+	}
 	if len(config.DomainWhitelist) != 2 || config.DomainWhitelist[0] != "example.com" || config.DomainWhitelist[1] != "api.example.org" {
 		t.Fatalf("DomainWhitelist = %#v, want %#v", config.DomainWhitelist, []string{"example.com", "api.example.org"})
 	}
@@ -68,6 +72,56 @@ func TestConfigUnmarshalsFromJSON(t *testing.T) {
 	}
 	if !config.DisableGlobalCORS {
 		t.Fatal("DisableGlobalCORS = false, want true")
+	}
+}
+
+func TestProxyRequiresAuthTokenAndDoesNotForwardIt(t *testing.T) {
+	upstreamAuthHeader := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAuthHeader <- r.Header.Get(proxyAuthHeader)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	proxy, err := NewProxy(Config{AuthToken: "proxy-secret"})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+
+	for _, token := range []string{"", "wrong-secret"} {
+		req := httptest.NewRequest(http.MethodGet, "/"+upstream.URL, nil)
+		if token != "" {
+			req.Header.Set(proxyAuthHeader, token)
+		}
+		recorder := httptest.NewRecorder()
+		proxy.ServeHTTP(recorder, req)
+
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("token %q: StatusCode = %d, want %d", token, recorder.Code, http.StatusUnauthorized)
+		}
+	}
+
+	select {
+	case <-upstreamAuthHeader:
+		t.Fatal("upstream was called for an unauthorized request")
+	default:
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/"+upstream.URL, nil)
+	req.Header.Set(proxyAuthHeader, "proxy-secret")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	select {
+	case got := <-upstreamAuthHeader:
+		if got != "" {
+			t.Fatalf("upstream %s = %q, want empty", proxyAuthHeader, got)
+		}
+	default:
+		t.Fatal("upstream was not called for an authorized request")
 	}
 }
 

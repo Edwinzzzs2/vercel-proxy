@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -15,10 +17,11 @@ import (
 const (
 	githubRepoURL    = "https://github.com/tbxark/vercel-proxy"
 	identityEncoding = "identity"
+	proxyAuthHeader  = "X-Proxy-Token"
 
 	corsAllowOrigin  = "*"
 	corsAllowMethods = "POST, GET, OPTIONS, PUT, DELETE"
-	corsAllowHeaders = "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-PROXY-HOST, X-PROXY-SCHEME"
+	corsAllowHeaders = "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-PROXY-HOST, X-PROXY-SCHEME, X-Proxy-Token"
 )
 
 var (
@@ -28,6 +31,10 @@ var (
 
 // Config controls proxy behavior without reading environment variables.
 type Config struct {
+	// AuthToken requires callers to provide the same value in X-Proxy-Token.
+	// Empty keeps authentication disabled for backwards compatibility.
+	AuthToken string `json:"authToken,omitempty"`
+
 	// Socks5Proxy routes all outbound upstream requests through a SOCKS5 proxy.
 	// It accepts either "host:port" or a "socks5://host:port" / "socks5h://host:port" URL.
 	Socks5Proxy string `json:"socks5Proxy,omitempty"`
@@ -47,6 +54,7 @@ type Config struct {
 // Proxy is a configurable reverse proxy handler.
 type Proxy struct {
 	client             *http.Client
+	authToken          string
 	domainWhitelist    []domainRule
 	disableCompression bool
 	globalCORS         bool
@@ -60,6 +68,7 @@ func NewProxy(config Config) (*Proxy, error) {
 	}
 	proxy := &Proxy{
 		client:             client,
+		authToken:          config.AuthToken,
 		domainWhitelist:    normalizeDomainWhitelist(config.DomainWhitelist),
 		disableCompression: config.DisableCompression,
 		globalCORS:         !config.DisableGlobalCORS,
@@ -111,6 +120,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, githubRepoURL, http.StatusMovedPermanently)
 		return
 	}
+	if !p.isAuthorized(r.Header.Get(proxyAuthHeader)) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized","details":"missing or invalid X-Proxy-Token"}`))
+		return
+	}
+	// The proxy credential is only for this service and must never reach upstream.
+	r.Header.Del(proxyAuthHeader)
 
 	// Get the URL to proxy
 	rawURL := proxyURL(r)
@@ -151,6 +168,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := proxyRaw(w, resp, r, p.globalCORS); err != nil {
 		log.Printf("Proxy response error: %v", err)
 	}
+}
+
+func (p *Proxy) isAuthorized(token string) bool {
+	if p.authToken == "" {
+		return true
+	}
+	expectedHash := sha256.Sum256([]byte(p.authToken))
+	actualHash := sha256.Sum256([]byte(token))
+	return subtle.ConstantTimeCompare(expectedHash[:], actualHash[:]) == 1
 }
 
 func proxyRaw(w http.ResponseWriter, resp *http.Response, req *http.Request, globalCORS bool) error {

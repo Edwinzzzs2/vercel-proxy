@@ -140,3 +140,5 @@ fabric.properties
 .vscode
 .idea
 bin
+.env
+!.env.example

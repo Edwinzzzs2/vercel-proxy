@@ -4,6 +4,9 @@ services:
     pull_policy: always
     ports:
       - "3000:3000"
+    environment:
+      PROXY_AUTH_TOKEN: "${PROXY_AUTH_TOKEN:?Set PROXY_AUTH_TOKEN in .env}"
+      PROXY_DOMAIN_WHITELIST: "${PROXY_DOMAIN_WHITELIST:-}"
     restart: unless-stopped
     # To customize proxy behavior, mount a config file and pass --config.
     # volumes:
