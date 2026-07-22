@@ -9,20 +9,30 @@ Simple http proxy for Vercel.
 ### Docker
 
 ```bash
-docker run -d --name vercel-proxy -p 3000:3000 ghcr.io/tbxark/vercel-proxy:latest
+docker run -d --name vercel-proxy --restart unless-stopped \
+  -p 3000:3000 ghcr.io/edwinzzzs2/vercel-proxy:latest
 ```
 
 Or with docker compose:
 
 ```bash
+git clone https://github.com/Edwinzzzs2/vercel-proxy.git
+cd vercel-proxy
 docker compose up -d
 ```
+
+The image supports both `linux/amd64` and `linux/arm64`. GitHub Actions publishes it to
+GitHub Container Registry after every push to `main`, and when a version tag such as
+`v1.0.0` is pushed. The first published package may need to be changed to **Public** in
+the repository owner's GitHub Packages settings before other users can pull it without
+authentication.
+
 To customize behavior, mount a JSON config file and pass `--config`:
 
 ```bash
 docker run -d --name vercel-proxy -p 3000:3000 \
   -v $(pwd)/config.json:/config/config.json \
-  ghcr.io/tbxark/vercel-proxy:latest --addr :3000 --config /config/config.json
+  ghcr.io/edwinzzzs2/vercel-proxy:latest --addr :3000 --config /config/config.json
 ```
 
 ### Usage
