@@ -78,6 +78,25 @@ curl -H 'X-Proxy-Token: replace-with-a-long-random-secret' \
   'https://project-name.vercel.app/https://example.com/path'
 ```
 
+JavaScript callers can send the same header with `fetch`:
+
+```javascript
+const response = await fetch(
+  "https://project-name.vercel.app/https://example.com/api",
+  {
+    headers: {
+      "X-Proxy-Token": "replace-with-a-long-random-secret",
+    },
+  },
+);
+```
+
+A browser address bar or a normal download link cannot attach a custom request
+header. Add targets that must support direct browser downloads to
+`PROXY_AUTH_WHITELIST`; otherwise use a client such as `curl` or application code
+that can send `X-Proxy-Token`. Do not put the token in the query string because URLs
+can be stored in browser history, access logs, and referrer headers.
+
 The proxy removes `X-Proxy-Token` before forwarding the request upstream.
 Authentication does not encrypt plain HTTP traffic; use HTTPS when transmitting
 sensitive credentials in production.
