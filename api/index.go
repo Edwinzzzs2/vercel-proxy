@@ -25,6 +25,7 @@ const (
 	identityEncoding = "identity"
 	proxyAuthHeader  = "X-Proxy-Token"
 	defaultLogLimit  = 200
+	defaultLogTZ     = "Asia/Shanghai"
 
 	corsAllowOrigin  = "*"
 	corsAllowMethods = "POST, GET, OPTIONS, PUT, DELETE"
@@ -66,6 +67,9 @@ type Config struct {
 
 	// LogLimit controls how many recent proxy requests are kept in memory.
 	LogLimit int `json:"logLimit,omitempty"`
+
+	// LogTimezone controls how timestamps are rendered on the /logs page.
+	LogTimezone string `json:"logTimezone,omitempty"`
 }
 
 // Proxy is a configurable reverse proxy handler.
@@ -77,6 +81,8 @@ type Proxy struct {
 	disableCompression bool
 	globalCORS         bool
 	logPassword        string
+	logLocation        *time.Location
+	logTimezone        string
 	requestLogs        *requestLogStore
 }
 
@@ -90,6 +96,7 @@ func NewProxy(config Config) (*Proxy, error) {
 	if logLimit <= 0 {
 		logLimit = defaultLogLimit
 	}
+	logLocation, logTimezone := loadLogLocation(config.LogTimezone)
 	proxy := &Proxy{
 		client:             client,
 		authToken:          config.AuthToken,
@@ -98,6 +105,8 @@ func NewProxy(config Config) (*Proxy, error) {
 		disableCompression: config.DisableCompression,
 		globalCORS:         !config.DisableGlobalCORS,
 		logPassword:        config.LogPassword,
+		logLocation:        logLocation,
+		logTimezone:        logTimezone,
 		requestLogs:        newRequestLogStore(logLimit),
 	}
 	proxy.client.CheckRedirect = proxy.checkRedirect
@@ -132,7 +141,23 @@ func ApplyEnvConfig(config Config) Config {
 			config.LogLimit = parsed
 		}
 	}
+	if timezone, ok := os.LookupEnv("PROXY_LOG_TIMEZONE"); ok {
+		config.LogTimezone = strings.TrimSpace(timezone)
+	}
 	return config
+}
+
+func loadLogLocation(name string) (*time.Location, string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = defaultLogTZ
+	}
+	location, err := time.LoadLocation(name)
+	if err != nil {
+		log.Printf("Invalid PROXY_LOG_TIMEZONE %q, fallback to UTC: %v", name, err)
+		return time.UTC, "UTC"
+	}
+	return location, name
 }
 
 func splitCommaSeparated(value string) []string {
@@ -179,6 +204,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Redirect to the GitHub repository
 	if r.URL.Path == "/" {
 		http.Redirect(w, r, githubRepoURL, http.StatusMovedPermanently)
+		return
+	}
+	if r.URL.Path == "/favicon.ico" {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if r.URL.Path == "/logs" {
@@ -269,7 +298,7 @@ func (p *Proxy) serveLogsPage(w http.ResponseWriter, r *http.Request) {
 
 	entries := p.requestLogs.snapshot()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = fmt.Fprint(w, renderLogsPage(entries))
+	_, _ = fmt.Fprint(w, renderLogsPage(entries, p.logLocation, p.logTimezone))
 }
 
 func isValidBasicAuthPassword(r *http.Request, expectedPassword string) bool {
@@ -396,14 +425,20 @@ func (s *requestLogStore) snapshot() []proxyRequestLog {
 	return result
 }
 
-func renderLogsPage(entries []proxyRequestLog) string {
+func renderLogsPage(entries []proxyRequestLog, location *time.Location, timezone string) string {
+	if location == nil {
+		location = time.UTC
+		timezone = "UTC"
+	}
 	var b strings.Builder
-	b.WriteString(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="5"><title>Proxy Logs</title><style>`)
-	b.WriteString(`body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7f9;color:#1f2937}main{padding:24px}h1{margin:0 0 8px;font-size:24px}.summary{margin:0 0 20px;color:#6b7280}.table-wrap{overflow:auto;background:#fff;border:1px solid #e5e7eb;border-radius:8px}table{border-collapse:collapse;width:100%;min-width:1080px}th,td{padding:10px 12px;border-bottom:1px solid #edf0f3;text-align:left;font-size:13px;vertical-align:top}th{background:#f9fafb;color:#4b5563;font-weight:600;position:sticky;top:0}.url{max-width:420px;word-break:break-all}.ok{color:#047857}.warn{color:#b45309}.bad{color:#b91c1c}.empty{padding:40px;text-align:center;color:#6b7280}.pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#eef2ff;color:#3730a3;font-size:12px}</style></head><body><main>`)
-	b.WriteString(`<h1>Proxy Logs</h1>`)
+	b.WriteString(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Proxy Logs</title><style>`)
+	b.WriteString(`body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7f9;color:#1f2937}main{padding:24px}.header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 8px}h1{margin:0;font-size:24px}.refresh{border:1px solid #d1d5db;border-radius:6px;background:#fff;color:#1f2937;padding:8px 12px;cursor:pointer}.summary{margin:0 0 20px;color:#6b7280}.table-wrap{overflow:auto;background:#fff;border:1px solid #e5e7eb;border-radius:8px}table{border-collapse:collapse;width:100%;min-width:1080px}th,td{padding:10px 12px;border-bottom:1px solid #edf0f3;text-align:left;font-size:13px;vertical-align:top}th{background:#f9fafb;color:#4b5563;font-weight:600;position:sticky;top:0}.url{max-width:420px;word-break:break-all}.ok{color:#047857}.warn{color:#b45309}.bad{color:#b91c1c}.empty{padding:40px;text-align:center;color:#6b7280}.pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#eef2ff;color:#3730a3;font-size:12px}</style></head><body><main>`)
+	b.WriteString(`<div class="header"><h1>Proxy Logs</h1><button class="refresh" onclick="location.reload()">Refresh</button></div>`)
 	b.WriteString(`<p class="summary">Showing latest `)
 	b.WriteString(strconv.Itoa(len(entries)))
-	b.WriteString(` requests. This page refreshes every 5 seconds.</p>`)
+	b.WriteString(` requests. Timezone: `)
+	b.WriteString(html.EscapeString(timezone))
+	b.WriteString(`.</p>`)
 	if len(entries) == 0 {
 		b.WriteString(`<div class="table-wrap"><div class="empty">No proxy requests recorded yet.</div></div>`)
 		b.WriteString(`</main></body></html>`)
@@ -419,7 +454,7 @@ func renderLogsPage(entries []proxyRequestLog) string {
 			statusClass = "warn"
 		}
 		b.WriteString(`<tr><td>`)
-		b.WriteString(html.EscapeString(entry.Time.Format("2006-01-02 15:04:05")))
+		b.WriteString(html.EscapeString(entry.Time.In(location).Format("2006-01-02 15:04:05")))
 		b.WriteString(`</td><td class="`)
 		b.WriteString(statusClass)
 		b.WriteString(`">`)

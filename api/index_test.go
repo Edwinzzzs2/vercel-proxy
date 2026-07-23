@@ -53,7 +53,8 @@ func TestConfigUnmarshalsFromJSON(t *testing.T) {
 		"disableCompression": true,
 		"disableGlobalCors": true,
 		"logPassword": "logs-secret",
-		"logLimit": 50
+		"logLimit": 50,
+		"logTimezone": "Asia/Shanghai"
 	}`)
 
 	var config Config
@@ -85,11 +86,15 @@ func TestConfigUnmarshalsFromJSON(t *testing.T) {
 	if config.LogLimit != 50 {
 		t.Fatalf("LogLimit = %d, want %d", config.LogLimit, 50)
 	}
+	if config.LogTimezone != "Asia/Shanghai" {
+		t.Fatalf("LogTimezone = %q, want %q", config.LogTimezone, "Asia/Shanghai")
+	}
 }
 
 func TestApplyEnvConfigReadsLogSettings(t *testing.T) {
 	t.Setenv("PROXY_LOG_PASSWORD", "logs-secret")
 	t.Setenv("PROXY_LOG_LIMIT", "25")
+	t.Setenv("PROXY_LOG_TIMEZONE", "Asia/Shanghai")
 
 	config := ApplyEnvConfig(Config{})
 
@@ -98,6 +103,9 @@ func TestApplyEnvConfigReadsLogSettings(t *testing.T) {
 	}
 	if config.LogLimit != 25 {
 		t.Fatalf("LogLimit = %d, want %d", config.LogLimit, 25)
+	}
+	if config.LogTimezone != "Asia/Shanghai" {
+		t.Fatalf("LogTimezone = %q, want %q", config.LogTimezone, "Asia/Shanghai")
 	}
 }
 
@@ -307,6 +315,28 @@ func TestLogsPageRequiresConfiguredPassword(t *testing.T) {
 	}
 }
 
+func TestFaviconDoesNotCreateProxyLogEntry(t *testing.T) {
+	proxy, err := NewProxy(Config{LogPassword: "logs-secret"})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+
+	faviconReq := httptest.NewRequest(http.MethodGet, "/favicon.ico", nil)
+	faviconRecorder := httptest.NewRecorder()
+	proxy.ServeHTTP(faviconRecorder, faviconReq)
+	if faviconRecorder.Code != http.StatusNoContent {
+		t.Fatalf("favicon StatusCode = %d, want %d", faviconRecorder.Code, http.StatusNoContent)
+	}
+
+	logsReq := httptest.NewRequest(http.MethodGet, "/logs", nil)
+	logsReq.SetBasicAuth("admin", "logs-secret")
+	logsRecorder := httptest.NewRecorder()
+	proxy.ServeHTTP(logsRecorder, logsReq)
+	if strings.Contains(logsRecorder.Body.String(), "favicon.ico") {
+		t.Fatalf("logs page recorded favicon request: %q", logsRecorder.Body.String())
+	}
+}
+
 func TestLogsPageUsesBasicAuthAndRedactsSensitiveQuery(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -348,6 +378,9 @@ func TestLogsPageUsesBasicAuthAndRedactsSensitiveQuery(t *testing.T) {
 	}
 	if !strings.Contains(body, "name=value") {
 		t.Fatalf("logs page body = %q, want non-sensitive query value", body)
+	}
+	if !strings.Contains(body, "Asia/Shanghai") {
+		t.Fatalf("logs page body = %q, want timezone label", body)
 	}
 }
 

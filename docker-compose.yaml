@@ -10,6 +10,7 @@ services:
       PROXY_DOMAIN_WHITELIST: "${PROXY_DOMAIN_WHITELIST:-}"
       PROXY_LOG_PASSWORD: "${PROXY_LOG_PASSWORD:-}"
       PROXY_LOG_LIMIT: "${PROXY_LOG_LIMIT:-200}"
+      PROXY_LOG_TIMEZONE: "${PROXY_LOG_TIMEZONE:-Asia/Shanghai}"
     restart: unless-stopped
     # To customize proxy behavior, mount a config file and pass --config.
     # volumes:

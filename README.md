@@ -46,6 +46,7 @@ Vercel project settings or in the Docker `.env` file:
 | `PROXY_DOMAIN_WHITELIST` | Empty | Comma-separated targets the service is allowed to proxy. Empty means all target domains are eligible, but authentication is still enforced. |
 | `PROXY_LOG_PASSWORD` | Empty | Password for the `/logs` page. Empty disables the page and returns `404`. |
 | `PROXY_LOG_LIMIT` | `200` | Number of recent proxy requests kept in memory for the `/logs` page. |
+| `PROXY_LOG_TIMEZONE` | `Asia/Shanghai` | Timezone used when rendering timestamps on the `/logs` page. |
 
 Request processing follows this order:
 
@@ -117,6 +118,7 @@ For request-level troubleshooting, configure a log page password:
 ```dotenv
 PROXY_LOG_PASSWORD=replace-with-a-log-page-password
 PROXY_LOG_LIMIT=200
+PROXY_LOG_TIMEZONE=Asia/Shanghai
 ```
 
 Then open:
@@ -127,10 +129,12 @@ http://your-server:3000/logs
 
 The browser will ask for HTTP Basic Auth credentials. The username can be any
 value; the password must match `PROXY_LOG_PASSWORD`. The page keeps recent
-requests in memory and refreshes every 5 seconds. It records target host,
+requests in memory and provides a refresh button. It records target host,
 sanitized target URL, status, auth mode, client IP, duration, and result. Query
 values with sensitive names such as `token`, `sig`, `jwt`, `password`, `secret`,
 or `key` are redacted before display.
+Timestamps are rendered with `PROXY_LOG_TIMEZONE`, which defaults to
+`Asia/Shanghai`.
 
 The log page is intended for short-term troubleshooting. Logs are lost when the
 container restarts, and multi-replica deployments keep separate in-memory logs
