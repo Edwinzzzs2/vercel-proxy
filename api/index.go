@@ -34,7 +34,7 @@ var (
 // Config controls proxy behavior without reading environment variables.
 type Config struct {
 	// AuthToken requires callers to provide the same value in X-Proxy-Token.
-	// Empty keeps authentication disabled for backwards compatibility.
+	// 为空时采用安全默认值：除 AuthWhitelist 外的目标全部拒绝访问。
 	AuthToken string `json:"authToken,omitempty"`
 
 	// AuthWhitelist 允许匹配的代理目标跳过鉴权。
@@ -215,8 +215,9 @@ func writeUnauthorized(w http.ResponseWriter) {
 }
 
 func (p *Proxy) isAuthorized(token string) bool {
+	// 未设置服务端 Token 时没有任何客户端凭据可以通过，避免意外形成开放代理。
 	if p.authToken == "" {
-		return true
+		return false
 	}
 	expectedHash := sha256.Sum256([]byte(p.authToken))
 	actualHash := sha256.Sum256([]byte(token))
@@ -356,7 +357,7 @@ func (p *Proxy) checkRedirect(req *http.Request, via []*http.Request) error {
 		return err
 	}
 	authorized, _ := req.Context().Value(authorizationContextKey{}).(bool)
-	if p.authToken != "" && !authorized && !p.isAuthWhitelisted(req.URL) {
+	if !authorized && !p.isAuthWhitelisted(req.URL) {
 		return &authenticationRequiredError{}
 	}
 	return nil

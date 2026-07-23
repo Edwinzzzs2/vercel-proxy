@@ -129,6 +129,32 @@ func TestProxyRequiresAuthTokenAndDoesNotForwardIt(t *testing.T) {
 	}
 }
 
+func TestProxyFailsClosedWhenAuthTokenIsNotConfigured(t *testing.T) {
+	upstreamCalled := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	proxy, err := NewProxy(Config{})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/"+upstream.URL, nil)
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	select {
+	case <-upstreamCalled:
+		t.Fatal("upstream was called without a configured auth token")
+	default:
+	}
+}
+
 func TestProxyAuthWhitelistBypassesTokenAndDoesNotForwardIt(t *testing.T) {
 	upstreamAuthHeader := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -185,7 +211,6 @@ func TestProxyAuthWhitelistRejectsRedirectToProtectedTarget(t *testing.T) {
 		t.Fatalf("url.Parse() error = %v", err)
 	}
 	proxy, err := NewProxy(Config{
-		AuthToken:     "proxy-secret",
 		AuthWhitelist: []string{publicURL.Host},
 	})
 	if err != nil {
@@ -245,7 +270,7 @@ func TestHandlerRedirectsRoot(t *testing.T) {
 	}
 }
 
-func TestHandlerProxiesResponse(t *testing.T) {
+func TestProxyProxiesResponse(t *testing.T) {
 	upstreamErr := make(chan error, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -280,9 +305,14 @@ func TestHandlerProxiesResponse(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/"+upstream.URL+"?param=value", strings.NewReader("request-body"))
 	req.Header.Set("X-Test-Header", "client-value")
+	req.Header.Set(proxyAuthHeader, "proxy-secret")
 	recorder := httptest.NewRecorder()
 
-	Handler(recorder, req)
+	proxy, err := NewProxy(Config{AuthToken: "proxy-secret"})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+	proxy.ServeHTTP(recorder, req)
 	assertUpstreamErr(t, upstreamErr)
 
 	resp := recorder.Result()
@@ -313,12 +343,13 @@ func TestProxyOverridesCORSHeadersByDefault(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := NewProxy(Config{})
+	proxy, err := NewProxy(Config{AuthToken: "proxy-secret"})
 	if err != nil {
 		t.Fatalf("NewProxy() error = %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/"+upstream.URL, nil)
+	req.Header.Set(proxyAuthHeader, "proxy-secret")
 	recorder := httptest.NewRecorder()
 
 	proxy.ServeHTTP(recorder, req)
@@ -351,12 +382,13 @@ func TestProxyKeepsCORSHeadersWhenGlobalCORSDisabled(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := NewProxy(Config{DisableGlobalCORS: true})
+	proxy, err := NewProxy(Config{AuthToken: "proxy-secret", DisableGlobalCORS: true})
 	if err != nil {
 		t.Fatalf("NewProxy() error = %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/"+upstream.URL, nil)
+	req.Header.Set(proxyAuthHeader, "proxy-secret")
 	recorder := httptest.NewRecorder()
 
 	proxy.ServeHTTP(recorder, req)
@@ -376,7 +408,7 @@ func TestProxyKeepsCORSHeadersWhenGlobalCORSDisabled(t *testing.T) {
 }
 
 func TestProxyDisablesUpstreamCompressionWhenConfigured(t *testing.T) {
-	proxy, err := NewProxy(Config{DisableCompression: true})
+	proxy, err := NewProxy(Config{AuthToken: "proxy-secret", DisableCompression: true})
 	if err != nil {
 		t.Fatalf("NewProxy() error = %v", err)
 	}
@@ -390,6 +422,7 @@ func TestProxyDisablesUpstreamCompressionWhenConfigured(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/"+upstream.URL, nil)
 	req.Header.Set("Accept-Encoding", "br, gzip, deflate")
+	req.Header.Set(proxyAuthHeader, "proxy-secret")
 	recorder := httptest.NewRecorder()
 
 	proxy.ServeHTTP(recorder, req)
@@ -537,12 +570,16 @@ func TestProxyRejectsRedirectOutsideWhitelist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("url.Parse() error = %v", err)
 	}
-	proxy, err := NewProxy(Config{DomainWhitelist: []string{allowedURL.Host}})
+	proxy, err := NewProxy(Config{
+		AuthToken:       "proxy-secret",
+		DomainWhitelist: []string{allowedURL.Host},
+	})
 	if err != nil {
 		t.Fatalf("NewProxy() error = %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/"+allowed.URL, nil)
+	req.Header.Set(proxyAuthHeader, "proxy-secret")
 	recorder := httptest.NewRecorder()
 
 	proxy.ServeHTTP(recorder, req)

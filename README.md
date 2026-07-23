@@ -32,31 +32,55 @@ GitHub Container Registry after every push to `main`, and when a version tag suc
 the repository owner's GitHub Packages settings before other users can pull it without
 authentication.
 
-Docker Compose requires `PROXY_AUTH_TOKEN`. Callers must send the same value in
-the `X-Proxy-Token` header. `PROXY_AUTH_WHITELIST` accepts comma-separated
-targets that may be proxied without this header. `PROXY_DOMAIN_WHITELIST` is
-optional and limits which targets the service can proxy.
-Authentication prevents unauthorized use but does not encrypt plain HTTP traffic; use
-HTTPS when transmitting sensitive credentials in production.
+### Configuration
 
-Both whitelist settings support exact domains and their subdomains, `*` / `?`
-wildcards, `-` exclusions, and optional ports. For example:
+The proxy is closed by default. When no variables are configured, proxy requests
+return `401` instead of creating an open proxy. Configure these variables in the
+Vercel project settings or in the Docker `.env` file:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PROXY_AUTH_TOKEN` | Empty | Secret required in the `X-Proxy-Token` request header. When empty, no protected target can be accessed. |
+| `PROXY_AUTH_WHITELIST` | Empty | Comma-separated targets that can be proxied without `X-Proxy-Token`. Empty means no target is exempt from authentication. |
+| `PROXY_DOMAIN_WHITELIST` | Empty | Comma-separated targets the service is allowed to proxy. Empty means all target domains are eligible, but authentication is still enforced. |
+
+Request processing follows this order:
+
+1. Targets outside `PROXY_DOMAIN_WHITELIST` return `403` when that variable is set.
+2. Targets matching `PROXY_AUTH_WHITELIST` are proxied without a token.
+3. Every other target requires the configured `PROXY_AUTH_TOKEN` and returns `401`
+   when the token is missing or invalid.
+
+Both whitelist variables support exact domains and their subdomains, `*` / `?`
+wildcards, `-` exclusions, and optional ports. For example, `github.com` also
+matches `api.github.com`, while `githubusercontent.com` matches GitHub release
+asset hosts such as `release-assets.githubusercontent.com`.
+
+Recommended configuration for Aliyun Codeup and GitHub:
 
 ```dotenv
-PROXY_AUTH_WHITELIST=example.com,*.public.example.org,downloads.example.net:8443
+PROXY_AUTH_TOKEN=replace-with-a-long-random-secret
+PROXY_AUTH_WHITELIST=openapi-rdc.aliyuncs.com,codeup.aliyun.com,github.com,githubusercontent.com,githubassets.com
+PROXY_DOMAIN_WHITELIST=
 ```
 
-Set the same environment variables in Vercel project settings and redeploy when
-using the serverless handler. A matching target can then be requested directly:
+After changing Vercel environment variables, redeploy the project. Whitelisted
+targets can be requested directly:
 
 ```bash
-curl 'https://project-name.vercel.app/https://example.com/path'
+curl 'https://project-name.vercel.app/https://github.com/owner/repository'
 ```
+
+Other targets require the token:
 
 ```bash
 curl -H 'X-Proxy-Token: replace-with-a-long-random-secret' \
-  'http://server-ip:3000/https://example.com'
+  'https://project-name.vercel.app/https://example.com/path'
 ```
+
+The proxy removes `X-Proxy-Token` before forwarding the request upstream.
+Authentication does not encrypt plain HTTP traffic; use HTTPS when transmitting
+sensitive credentials in production.
 
 To customize behavior, mount a JSON config file and pass `--config`:
 
