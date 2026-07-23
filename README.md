@@ -12,6 +12,7 @@ Simple http proxy for Vercel.
 docker run -d --name vercel-proxy --restart unless-stopped \
   -p 3000:3000 \
   -e PROXY_AUTH_TOKEN='replace-with-a-long-random-secret' \
+  -e PROXY_LOG_PASSWORD='replace-with-a-log-page-password' \
   ghcr.io/edwinzzzs2/vercel-proxy:latest
 ```
 
@@ -43,6 +44,8 @@ Vercel project settings or in the Docker `.env` file:
 | `PROXY_AUTH_TOKEN` | Empty | Secret required in the `X-Proxy-Token` request header. When empty, no protected target can be accessed. |
 | `PROXY_AUTH_WHITELIST` | Empty | Comma-separated targets that can be proxied without `X-Proxy-Token`. Empty means no target is exempt from authentication. |
 | `PROXY_DOMAIN_WHITELIST` | Empty | Comma-separated targets the service is allowed to proxy. Empty means all target domains are eligible, but authentication is still enforced. |
+| `PROXY_LOG_PASSWORD` | Empty | Password for the `/logs` page. Empty disables the page and returns `404`. |
+| `PROXY_LOG_LIMIT` | `200` | Number of recent proxy requests kept in memory for the `/logs` page. |
 
 Request processing follows this order:
 
@@ -100,6 +103,38 @@ can be stored in browser history, access logs, and referrer headers.
 The proxy removes `X-Proxy-Token` before forwarding the request upstream.
 Authentication does not encrypt plain HTTP traffic; use HTTPS when transmitting
 sensitive credentials in production.
+
+### Request logs
+
+Docker deployments can inspect container logs with:
+
+```bash
+docker logs -f vercel-proxy
+```
+
+For request-level troubleshooting, configure a log page password:
+
+```dotenv
+PROXY_LOG_PASSWORD=replace-with-a-log-page-password
+PROXY_LOG_LIMIT=200
+```
+
+Then open:
+
+```text
+http://your-server:3000/logs
+```
+
+The browser will ask for HTTP Basic Auth credentials. The username can be any
+value; the password must match `PROXY_LOG_PASSWORD`. The page keeps recent
+requests in memory and refreshes every 5 seconds. It records target host,
+sanitized target URL, status, auth mode, client IP, duration, and result. Query
+values with sensitive names such as `token`, `sig`, `jwt`, `password`, `secret`,
+or `key` are redacted before display.
+
+The log page is intended for short-term troubleshooting. Logs are lost when the
+container restarts, and multi-replica deployments keep separate in-memory logs
+per replica.
 
 To customize behavior, mount a JSON config file and pass `--config`:
 

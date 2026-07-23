@@ -51,7 +51,9 @@ func TestConfigUnmarshalsFromJSON(t *testing.T) {
 		"socks5Proxy": "127.0.0.1:1080",
 		"domainWhitelist": ["example.com", "api.example.org"],
 		"disableCompression": true,
-		"disableGlobalCors": true
+		"disableGlobalCors": true,
+		"logPassword": "logs-secret",
+		"logLimit": 50
 	}`)
 
 	var config Config
@@ -76,6 +78,26 @@ func TestConfigUnmarshalsFromJSON(t *testing.T) {
 	}
 	if !config.DisableGlobalCORS {
 		t.Fatal("DisableGlobalCORS = false, want true")
+	}
+	if config.LogPassword != "logs-secret" {
+		t.Fatalf("LogPassword = %q, want %q", config.LogPassword, "logs-secret")
+	}
+	if config.LogLimit != 50 {
+		t.Fatalf("LogLimit = %d, want %d", config.LogLimit, 50)
+	}
+}
+
+func TestApplyEnvConfigReadsLogSettings(t *testing.T) {
+	t.Setenv("PROXY_LOG_PASSWORD", "logs-secret")
+	t.Setenv("PROXY_LOG_LIMIT", "25")
+
+	config := ApplyEnvConfig(Config{})
+
+	if config.LogPassword != "logs-secret" {
+		t.Fatalf("LogPassword = %q, want %q", config.LogPassword, "logs-secret")
+	}
+	if config.LogLimit != 25 {
+		t.Fatalf("LogLimit = %d, want %d", config.LogLimit, 25)
 	}
 }
 
@@ -267,6 +289,65 @@ func TestHandlerRedirectsRoot(t *testing.T) {
 	}
 	if got := resp.Header.Get("Location"); got != githubRepoURL {
 		t.Fatalf("Location = %q, want %q", got, githubRepoURL)
+	}
+}
+
+func TestLogsPageRequiresConfiguredPassword(t *testing.T) {
+	proxy, err := NewProxy(Config{})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/logs", nil)
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("StatusCode = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+}
+
+func TestLogsPageUsesBasicAuthAndRedactsSensitiveQuery(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	proxy, err := NewProxy(Config{
+		AuthToken:   "proxy-secret",
+		LogPassword: "logs-secret",
+	})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+
+	proxyReq := httptest.NewRequest(http.MethodGet, "/"+upstream.URL+"?sig=abc-secret&jwt=jwt-secret&name=value", nil)
+	proxyReq.Header.Set(proxyAuthHeader, "proxy-secret")
+	proxy.ServeHTTP(httptest.NewRecorder(), proxyReq)
+
+	unauthorizedReq := httptest.NewRequest(http.MethodGet, "/logs", nil)
+	unauthorizedRecorder := httptest.NewRecorder()
+	proxy.ServeHTTP(unauthorizedRecorder, unauthorizedReq)
+	if unauthorizedRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized StatusCode = %d, want %d", unauthorizedRecorder.Code, http.StatusUnauthorized)
+	}
+
+	logsReq := httptest.NewRequest(http.MethodGet, "/logs", nil)
+	logsReq.SetBasicAuth("admin", "logs-secret")
+	logsRecorder := httptest.NewRecorder()
+	proxy.ServeHTTP(logsRecorder, logsReq)
+
+	if logsRecorder.Code != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d", logsRecorder.Code, http.StatusOK)
+	}
+	body := logsRecorder.Body.String()
+	for _, secret := range []string{"abc-secret", "jwt-secret"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("logs page leaked sensitive value %q in body %q", secret, body)
+		}
+	}
+	if !strings.Contains(body, "name=value") {
+		t.Fatalf("logs page body = %q, want non-sensitive query value", body)
 	}
 }
 

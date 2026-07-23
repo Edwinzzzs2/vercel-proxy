@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -13,13 +14,17 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
 	githubRepoURL    = "https://github.com/tbxark/vercel-proxy"
 	identityEncoding = "identity"
 	proxyAuthHeader  = "X-Proxy-Token"
+	defaultLogLimit  = 200
 
 	corsAllowOrigin  = "*"
 	corsAllowMethods = "POST, GET, OPTIONS, PUT, DELETE"
@@ -55,6 +60,12 @@ type Config struct {
 
 	// DisableGlobalCORS disables proxy-managed CORS headers for all responses.
 	DisableGlobalCORS bool `json:"disableGlobalCors,omitempty"`
+
+	// LogPassword enables the /logs page. Empty keeps the page disabled.
+	LogPassword string `json:"logPassword,omitempty"`
+
+	// LogLimit controls how many recent proxy requests are kept in memory.
+	LogLimit int `json:"logLimit,omitempty"`
 }
 
 // Proxy is a configurable reverse proxy handler.
@@ -65,6 +76,8 @@ type Proxy struct {
 	domainWhitelist    []domainRule
 	disableCompression bool
 	globalCORS         bool
+	logPassword        string
+	requestLogs        *requestLogStore
 }
 
 // NewProxy creates a reusable proxy handler with explicit configuration.
@@ -73,6 +86,10 @@ func NewProxy(config Config) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
+	logLimit := config.LogLimit
+	if logLimit <= 0 {
+		logLimit = defaultLogLimit
+	}
 	proxy := &Proxy{
 		client:             client,
 		authToken:          config.AuthToken,
@@ -80,6 +97,8 @@ func NewProxy(config Config) (*Proxy, error) {
 		domainWhitelist:    normalizeDomainWhitelist(config.DomainWhitelist),
 		disableCompression: config.DisableCompression,
 		globalCORS:         !config.DisableGlobalCORS,
+		logPassword:        config.LogPassword,
+		requestLogs:        newRequestLogStore(logLimit),
 	}
 	proxy.client.CheckRedirect = proxy.checkRedirect
 
@@ -104,6 +123,14 @@ func ApplyEnvConfig(config Config) Config {
 	}
 	if whitelist, ok := os.LookupEnv("PROXY_DOMAIN_WHITELIST"); ok {
 		config.DomainWhitelist = splitCommaSeparated(whitelist)
+	}
+	if password, ok := os.LookupEnv("PROXY_LOG_PASSWORD"); ok {
+		config.LogPassword = strings.TrimSpace(password)
+	}
+	if limit, ok := os.LookupEnv("PROXY_LOG_LIMIT"); ok {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(limit)); err == nil {
+			config.LogLimit = parsed
+		}
 	}
 	return config
 }
@@ -131,6 +158,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
 	defer func() {
 		if err := recover(); err != nil {
 			log.Printf("WithHandler panic: %v", err)
@@ -153,20 +181,28 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, githubRepoURL, http.StatusMovedPermanently)
 		return
 	}
+	if r.URL.Path == "/logs" {
+		p.serveLogsPage(w, r)
+		return
+	}
 	// Get the URL to proxy
 	rawURL := proxyURL(r)
 	targetURL, err := parseTargetURL(rawURL)
 	if err != nil {
 		http.Error(w, "invalid url: "+rawURL, http.StatusBadRequest)
+		p.recordRequestLog(r, nil, http.StatusBadRequest, "invalid_url", err.Error(), false, false, time.Since(startedAt))
 		return
 	}
 	if err := p.checkDomain(targetURL); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
+		p.recordRequestLog(r, targetURL, http.StatusForbidden, "domain_blocked", err.Error(), false, false, time.Since(startedAt))
 		return
 	}
 	authorized := p.isAuthorized(r.Header.Get(proxyAuthHeader))
-	if !authorized && !p.isAuthWhitelisted(targetURL) {
+	authWhitelisted := p.isAuthWhitelisted(targetURL)
+	if !authorized && !authWhitelisted {
 		writeUnauthorized(w)
+		p.recordRequestLog(r, targetURL, http.StatusUnauthorized, "unauthorized", "missing or invalid proxy token", authorized, authWhitelisted, time.Since(startedAt))
 		return
 	}
 
@@ -191,27 +227,234 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var domainErr *domainNotAllowedError
 		if errors.As(err, &domainErr) {
 			http.Error(w, domainErr.Error(), http.StatusForbidden)
+			p.recordRequestLog(r, targetURL, http.StatusForbidden, "redirect_domain_blocked", domainErr.Error(), authorized, authWhitelisted, time.Since(startedAt))
 			return
 		}
 		var authErr *authenticationRequiredError
 		if errors.As(err, &authErr) {
 			writeUnauthorized(w)
+			p.recordRequestLog(r, targetURL, http.StatusUnauthorized, "redirect_unauthorized", authErr.Error(), authorized, authWhitelisted, time.Since(startedAt))
 			return
 		}
 		internalServerError(w, err)
+		p.recordRequestLog(r, targetURL, http.StatusInternalServerError, "upstream_error", err.Error(), authorized, authWhitelisted, time.Since(startedAt))
 		return
 	}
 	defer closeResponseBody(resp)
 
 	if err := proxyRaw(w, resp, r, p.globalCORS); err != nil {
 		log.Printf("Proxy response error: %v", err)
+		p.recordRequestLog(r, targetURL, resp.StatusCode, "copy_error", err.Error(), authorized, authWhitelisted, time.Since(startedAt))
+		return
 	}
+	p.recordRequestLog(r, targetURL, resp.StatusCode, "proxied", resp.Status, authorized, authWhitelisted, time.Since(startedAt))
 }
 
 func writeUnauthorized(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = w.Write([]byte(`{"error":"unauthorized","details":"missing or invalid X-Proxy-Token"}`))
+}
+
+func (p *Proxy) serveLogsPage(w http.ResponseWriter, r *http.Request) {
+	if p.logPassword == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if !isValidBasicAuthPassword(r, p.logPassword) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Proxy Logs"`)
+		http.Error(w, "proxy logs require password", http.StatusUnauthorized)
+		return
+	}
+
+	entries := p.requestLogs.snapshot()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprint(w, renderLogsPage(entries))
+}
+
+func isValidBasicAuthPassword(r *http.Request, expectedPassword string) bool {
+	_, password, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	expectedHash := sha256.Sum256([]byte(expectedPassword))
+	actualHash := sha256.Sum256([]byte(password))
+	return subtle.ConstantTimeCompare(expectedHash[:], actualHash[:]) == 1
+}
+
+func (p *Proxy) recordRequestLog(r *http.Request, targetURL *url.URL, status int, result, detail string, authorized, authWhitelisted bool, duration time.Duration) {
+	if p.requestLogs == nil {
+		return
+	}
+	p.requestLogs.add(proxyRequestLog{
+		Time:            time.Now(),
+		Method:          r.Method,
+		ClientIP:        clientIP(r),
+		Target:          sanitizeTargetURLForLog(targetURL),
+		TargetHost:      targetHostForLog(targetURL),
+		Status:          status,
+		Result:          result,
+		Detail:          detail,
+		Authorized:      authorized,
+		AuthWhitelisted: authWhitelisted,
+		Duration:        duration,
+	})
+}
+
+func clientIP(r *http.Request) string {
+	if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
+		return strings.TrimSpace(strings.Split(forwardedFor, ",")[0])
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		return strings.TrimSpace(realIP)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func targetHostForLog(targetURL *url.URL) string {
+	if targetURL == nil {
+		return ""
+	}
+	return targetURL.Host
+}
+
+func sanitizeTargetURLForLog(targetURL *url.URL) string {
+	if targetURL == nil {
+		return ""
+	}
+	safeURL := *targetURL
+	query := safeURL.Query()
+	for key := range query {
+		if isSensitiveQueryKey(key) {
+			query.Set(key, "[REDACTED]")
+		}
+	}
+	safeURL.RawQuery = query.Encode()
+	return safeURL.String()
+}
+
+func isSensitiveQueryKey(key string) bool {
+	key = strings.ToLower(key)
+	for _, pattern := range []string{"token", "authorization", "password", "secret", "sig", "jwt", "key"} {
+		if strings.Contains(key, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+type proxyRequestLog struct {
+	Time            time.Time
+	Method          string
+	ClientIP        string
+	Target          string
+	TargetHost      string
+	Status          int
+	Result          string
+	Detail          string
+	Authorized      bool
+	AuthWhitelisted bool
+	Duration        time.Duration
+}
+
+type requestLogStore struct {
+	mu      sync.Mutex
+	limit   int
+	entries []proxyRequestLog
+}
+
+func newRequestLogStore(limit int) *requestLogStore {
+	if limit <= 0 {
+		limit = defaultLogLimit
+	}
+	return &requestLogStore{limit: limit}
+}
+
+func (s *requestLogStore) add(entry proxyRequestLog) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.entries = append(s.entries, entry)
+	if overflow := len(s.entries) - s.limit; overflow > 0 {
+		s.entries = append([]proxyRequestLog(nil), s.entries[overflow:]...)
+	}
+}
+
+func (s *requestLogStore) snapshot() []proxyRequestLog {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 页面默认展示最新记录在最上方，排查刚发生的请求更快。
+	result := make([]proxyRequestLog, 0, len(s.entries))
+	for i := len(s.entries) - 1; i >= 0; i-- {
+		result = append(result, s.entries[i])
+	}
+	return result
+}
+
+func renderLogsPage(entries []proxyRequestLog) string {
+	var b strings.Builder
+	b.WriteString(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="5"><title>Proxy Logs</title><style>`)
+	b.WriteString(`body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7f9;color:#1f2937}main{padding:24px}h1{margin:0 0 8px;font-size:24px}.summary{margin:0 0 20px;color:#6b7280}.table-wrap{overflow:auto;background:#fff;border:1px solid #e5e7eb;border-radius:8px}table{border-collapse:collapse;width:100%;min-width:1080px}th,td{padding:10px 12px;border-bottom:1px solid #edf0f3;text-align:left;font-size:13px;vertical-align:top}th{background:#f9fafb;color:#4b5563;font-weight:600;position:sticky;top:0}.url{max-width:420px;word-break:break-all}.ok{color:#047857}.warn{color:#b45309}.bad{color:#b91c1c}.empty{padding:40px;text-align:center;color:#6b7280}.pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#eef2ff;color:#3730a3;font-size:12px}</style></head><body><main>`)
+	b.WriteString(`<h1>Proxy Logs</h1>`)
+	b.WriteString(`<p class="summary">Showing latest `)
+	b.WriteString(strconv.Itoa(len(entries)))
+	b.WriteString(` requests. This page refreshes every 5 seconds.</p>`)
+	if len(entries) == 0 {
+		b.WriteString(`<div class="table-wrap"><div class="empty">No proxy requests recorded yet.</div></div>`)
+		b.WriteString(`</main></body></html>`)
+		return b.String()
+	}
+
+	b.WriteString(`<div class="table-wrap"><table><thead><tr><th>Time</th><th>Status</th><th>Result</th><th>Method</th><th>Host</th><th>Target</th><th>Auth</th><th>IP</th><th>Duration</th><th>Detail</th></tr></thead><tbody>`)
+	for _, entry := range entries {
+		statusClass := "ok"
+		if entry.Status >= 500 {
+			statusClass = "bad"
+		} else if entry.Status >= 400 {
+			statusClass = "warn"
+		}
+		b.WriteString(`<tr><td>`)
+		b.WriteString(html.EscapeString(entry.Time.Format("2006-01-02 15:04:05")))
+		b.WriteString(`</td><td class="`)
+		b.WriteString(statusClass)
+		b.WriteString(`">`)
+		b.WriteString(strconv.Itoa(entry.Status))
+		b.WriteString(`</td><td>`)
+		b.WriteString(html.EscapeString(entry.Result))
+		b.WriteString(`</td><td>`)
+		b.WriteString(html.EscapeString(entry.Method))
+		b.WriteString(`</td><td>`)
+		b.WriteString(html.EscapeString(entry.TargetHost))
+		b.WriteString(`</td><td class="url">`)
+		b.WriteString(html.EscapeString(entry.Target))
+		b.WriteString(`</td><td>`)
+		b.WriteString(authLabel(entry))
+		b.WriteString(`</td><td>`)
+		b.WriteString(html.EscapeString(entry.ClientIP))
+		b.WriteString(`</td><td>`)
+		b.WriteString(html.EscapeString(entry.Duration.Truncate(time.Millisecond).String()))
+		b.WriteString(`</td><td>`)
+		b.WriteString(html.EscapeString(entry.Detail))
+		b.WriteString(`</td></tr>`)
+	}
+	b.WriteString(`</tbody></table></div></main></body></html>`)
+	return b.String()
+}
+
+func authLabel(entry proxyRequestLog) string {
+	switch {
+	case entry.AuthWhitelisted:
+		return `<span class="pill">whitelist</span>`
+	case entry.Authorized:
+		return `<span class="pill">token</span>`
+	default:
+		return `<span class="pill">none</span>`
+	}
 }
 
 func (p *Proxy) isAuthorized(token string) bool {
