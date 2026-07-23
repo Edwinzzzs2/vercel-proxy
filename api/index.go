@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 )
@@ -26,7 +28,7 @@ const (
 
 var (
 	proxyURLPattern = regexp.MustCompile(`^/*(https?:)/*`)
-	defaultProxy    = mustNewProxy(Config{})
+	defaultProxy    = mustNewProxy(ApplyEnvConfig(Config{}))
 )
 
 // Config controls proxy behavior without reading environment variables.
@@ -34,6 +36,10 @@ type Config struct {
 	// AuthToken requires callers to provide the same value in X-Proxy-Token.
 	// Empty keeps authentication disabled for backwards compatibility.
 	AuthToken string `json:"authToken,omitempty"`
+
+	// AuthWhitelist 允许匹配的代理目标跳过鉴权。
+	// 规则与 DomainWhitelist 一致，支持子域名、通配符、排除项和端口。
+	AuthWhitelist []string `json:"authWhitelist,omitempty"`
 
 	// Socks5Proxy routes all outbound upstream requests through a SOCKS5 proxy.
 	// It accepts either "host:port" or a "socks5://host:port" / "socks5h://host:port" URL.
@@ -55,6 +61,7 @@ type Config struct {
 type Proxy struct {
 	client             *http.Client
 	authToken          string
+	authWhitelist      []domainRule
 	domainWhitelist    []domainRule
 	disableCompression bool
 	globalCORS         bool
@@ -69,6 +76,7 @@ func NewProxy(config Config) (*Proxy, error) {
 	proxy := &Proxy{
 		client:             client,
 		authToken:          config.AuthToken,
+		authWhitelist:      normalizeDomainWhitelist(config.AuthWhitelist),
 		domainWhitelist:    normalizeDomainWhitelist(config.DomainWhitelist),
 		disableCompression: config.DisableCompression,
 		globalCORS:         !config.DisableGlobalCORS,
@@ -84,6 +92,31 @@ func mustNewProxy(config Config) *Proxy {
 		panic(err)
 	}
 	return proxy
+}
+
+// ApplyEnvConfig 将 Docker 或 Vercel 的运行时环境变量覆盖到配置中。
+func ApplyEnvConfig(config Config) Config {
+	if authToken, ok := os.LookupEnv("PROXY_AUTH_TOKEN"); ok {
+		config.AuthToken = strings.TrimSpace(authToken)
+	}
+	if whitelist, ok := os.LookupEnv("PROXY_AUTH_WHITELIST"); ok {
+		config.AuthWhitelist = splitCommaSeparated(whitelist)
+	}
+	if whitelist, ok := os.LookupEnv("PROXY_DOMAIN_WHITELIST"); ok {
+		config.DomainWhitelist = splitCommaSeparated(whitelist)
+	}
+	return config
+}
+
+func splitCommaSeparated(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if entry := strings.TrimSpace(part); entry != "" {
+			result = append(result, entry)
+		}
+	}
+	return result
 }
 
 func internalServerError(w http.ResponseWriter, err error) {
@@ -120,15 +153,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, githubRepoURL, http.StatusMovedPermanently)
 		return
 	}
-	if !p.isAuthorized(r.Header.Get(proxyAuthHeader)) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":"unauthorized","details":"missing or invalid X-Proxy-Token"}`))
-		return
-	}
-	// The proxy credential is only for this service and must never reach upstream.
-	r.Header.Del(proxyAuthHeader)
-
 	// Get the URL to proxy
 	rawURL := proxyURL(r)
 	targetURL, err := parseTargetURL(rawURL)
@@ -140,14 +164,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
+	authorized := p.isAuthorized(r.Header.Get(proxyAuthHeader))
+	if !authorized && !p.isAuthWhitelisted(targetURL) {
+		writeUnauthorized(w)
+		return
+	}
 
 	// Create a new request
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
+	// 记录本次请求是否已鉴权，避免公开目标通过重定向访问受保护目标。
+	ctx := context.WithValue(r.Context(), authorizationContextKey{}, authorized)
+	req, err := http.NewRequestWithContext(ctx, r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		internalServerError(w, err)
 		return
 	}
 	copyHeaders(r.Header, req.Header)
+	// The proxy credential is only for this service and must never reach upstream.
+	req.Header.Del(proxyAuthHeader)
 	if p.disableCompression {
 		disableUpstreamCompression(req.Header)
 	}
@@ -160,6 +193,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, domainErr.Error(), http.StatusForbidden)
 			return
 		}
+		var authErr *authenticationRequiredError
+		if errors.As(err, &authErr) {
+			writeUnauthorized(w)
+			return
+		}
 		internalServerError(w, err)
 		return
 	}
@@ -170,6 +208,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func writeUnauthorized(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write([]byte(`{"error":"unauthorized","details":"missing or invalid X-Proxy-Token"}`))
+}
+
 func (p *Proxy) isAuthorized(token string) bool {
 	if p.authToken == "" {
 		return true
@@ -177,6 +221,11 @@ func (p *Proxy) isAuthorized(token string) bool {
 	expectedHash := sha256.Sum256([]byte(p.authToken))
 	actualHash := sha256.Sum256([]byte(token))
 	return subtle.ConstantTimeCompare(expectedHash[:], actualHash[:]) == 1
+}
+
+func (p *Proxy) isAuthWhitelisted(targetURL *url.URL) bool {
+	// 空白名单必须表示全部需要鉴权，不能复用域名白名单的“空即全放行”语义。
+	return len(p.authWhitelist) > 0 && isDomainURLAllowed(targetURL, p.authWhitelist)
 }
 
 func proxyRaw(w http.ResponseWriter, resp *http.Response, req *http.Request, globalCORS bool) error {
@@ -303,7 +352,22 @@ func (p *Proxy) checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errors.New("stopped after 10 redirects")
 	}
-	return p.checkDomain(req.URL)
+	if err := p.checkDomain(req.URL); err != nil {
+		return err
+	}
+	authorized, _ := req.Context().Value(authorizationContextKey{}).(bool)
+	if p.authToken != "" && !authorized && !p.isAuthWhitelisted(req.URL) {
+		return &authenticationRequiredError{}
+	}
+	return nil
+}
+
+type authorizationContextKey struct{}
+
+type authenticationRequiredError struct{}
+
+func (e *authenticationRequiredError) Error() string {
+	return "authentication required after redirect"
 }
 
 type domainNotAllowedError struct {

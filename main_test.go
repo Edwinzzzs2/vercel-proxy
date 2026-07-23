@@ -55,15 +55,21 @@ func TestLoadConfigReadsJSONFile(t *testing.T) {
 
 func TestApplyEnvConfigOverridesAuthenticationAndWhitelist(t *testing.T) {
 	t.Setenv("PROXY_AUTH_TOKEN", " env-secret ")
+	t.Setenv("PROXY_AUTH_WHITELIST", " public.example.com, *.assets.example.com ")
 	t.Setenv("PROXY_DOMAIN_WHITELIST", "openapi-rdc.aliyuncs.com, api.example.com ")
 
 	config := applyEnvConfig(api.Config{
 		AuthToken:       "file-secret",
+		AuthWhitelist:   []string{"file-public.example.com"},
 		DomainWhitelist: []string{"file.example.com"},
 	})
 
 	if config.AuthToken != "env-secret" {
 		t.Fatalf("AuthToken = %q, want %q", config.AuthToken, "env-secret")
+	}
+	authWant := []string{"public.example.com", "*.assets.example.com"}
+	if !reflect.DeepEqual(config.AuthWhitelist, authWant) {
+		t.Fatalf("AuthWhitelist = %#v, want %#v", config.AuthWhitelist, authWant)
 	}
 	want := []string{"openapi-rdc.aliyuncs.com", "api.example.com"}
 	if !reflect.DeepEqual(config.DomainWhitelist, want) {

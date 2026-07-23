@@ -47,6 +47,7 @@ func TestProxyURLKeepsExistingFormats(t *testing.T) {
 func TestConfigUnmarshalsFromJSON(t *testing.T) {
 	data := []byte(`{
 		"authToken": "proxy-secret",
+		"authWhitelist": ["public.example.com"],
 		"socks5Proxy": "127.0.0.1:1080",
 		"domainWhitelist": ["example.com", "api.example.org"],
 		"disableCompression": true,
@@ -63,6 +64,9 @@ func TestConfigUnmarshalsFromJSON(t *testing.T) {
 	}
 	if config.AuthToken != "proxy-secret" {
 		t.Fatalf("AuthToken = %q, want %q", config.AuthToken, "proxy-secret")
+	}
+	if len(config.AuthWhitelist) != 1 || config.AuthWhitelist[0] != "public.example.com" {
+		t.Fatalf("AuthWhitelist = %#v, want %#v", config.AuthWhitelist, []string{"public.example.com"})
 	}
 	if len(config.DomainWhitelist) != 2 || config.DomainWhitelist[0] != "example.com" || config.DomainWhitelist[1] != "api.example.org" {
 		t.Fatalf("DomainWhitelist = %#v, want %#v", config.DomainWhitelist, []string{"example.com", "api.example.org"})
@@ -122,6 +126,83 @@ func TestProxyRequiresAuthTokenAndDoesNotForwardIt(t *testing.T) {
 		}
 	default:
 		t.Fatal("upstream was not called for an authorized request")
+	}
+}
+
+func TestProxyAuthWhitelistBypassesTokenAndDoesNotForwardIt(t *testing.T) {
+	upstreamAuthHeader := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAuthHeader <- r.Header.Get(proxyAuthHeader)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	proxy, err := NewProxy(Config{
+		AuthToken:     "proxy-secret",
+		AuthWhitelist: []string{upstreamURL.Host},
+	})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/"+upstream.URL, nil)
+	req.Header.Set(proxyAuthHeader, "wrong-secret")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	select {
+	case got := <-upstreamAuthHeader:
+		if got != "" {
+			t.Fatalf("upstream %s = %q, want empty", proxyAuthHeader, got)
+		}
+	default:
+		t.Fatal("upstream was not called for an auth-whitelisted request")
+	}
+}
+
+func TestProxyAuthWhitelistRejectsRedirectToProtectedTarget(t *testing.T) {
+	protectedCalled := make(chan struct{}, 1)
+	protected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		protectedCalled <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer protected.Close()
+
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, protected.URL, http.StatusFound)
+	}))
+	defer public.Close()
+
+	publicURL, err := url.Parse(public.URL)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	proxy, err := NewProxy(Config{
+		AuthToken:     "proxy-secret",
+		AuthWhitelist: []string{publicURL.Host},
+	})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/"+public.URL, nil)
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	select {
+	case <-protectedCalled:
+		t.Fatal("protected redirect target was called without authentication")
+	default:
 	}
 }
 

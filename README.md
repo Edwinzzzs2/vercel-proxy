@@ -33,10 +33,25 @@ the repository owner's GitHub Packages settings before other users can pull it w
 authentication.
 
 Docker Compose requires `PROXY_AUTH_TOKEN`. Callers must send the same value in
-the `X-Proxy-Token` header. `PROXY_DOMAIN_WHITELIST` is optional and accepts
-comma-separated domain rules; leaving it empty allows all target domains.
+the `X-Proxy-Token` header. `PROXY_AUTH_WHITELIST` accepts comma-separated
+targets that may be proxied without this header. `PROXY_DOMAIN_WHITELIST` is
+optional and limits which targets the service can proxy.
 Authentication prevents unauthorized use but does not encrypt plain HTTP traffic; use
 HTTPS when transmitting sensitive credentials in production.
+
+Both whitelist settings support exact domains and their subdomains, `*` / `?`
+wildcards, `-` exclusions, and optional ports. For example:
+
+```dotenv
+PROXY_AUTH_WHITELIST=example.com,*.public.example.org,downloads.example.net:8443
+```
+
+Set the same environment variables in Vercel project settings and redeploy when
+using the serverless handler. A matching target can then be requested directly:
+
+```bash
+curl 'https://project-name.vercel.app/https://example.com/path'
+```
 
 ```bash
 curl -H 'X-Proxy-Token: replace-with-a-long-random-secret' \

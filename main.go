@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/tbxark/vercel-proxy/api"
 )
@@ -46,24 +45,7 @@ func main() {
 }
 
 func applyEnvConfig(config api.Config) api.Config {
-	if authToken, ok := os.LookupEnv("PROXY_AUTH_TOKEN"); ok {
-		config.AuthToken = strings.TrimSpace(authToken)
-	}
-	if whitelist, ok := os.LookupEnv("PROXY_DOMAIN_WHITELIST"); ok {
-		config.DomainWhitelist = splitCommaSeparated(whitelist)
-	}
-	return config
-}
-
-func splitCommaSeparated(value string) []string {
-	parts := strings.Split(value, ",")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if entry := strings.TrimSpace(part); entry != "" {
-			result = append(result, entry)
-		}
-	}
-	return result
+	return api.ApplyEnvConfig(config)
 }
 
 func loadConfig(path string) (api.Config, error) {
